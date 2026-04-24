@@ -3,6 +3,7 @@ import Combine
 import AVFoundation
 import Vision
 import UIKit
+import AudioToolbox
 
 struct BarcodeResult {
     let value: String
@@ -126,6 +127,8 @@ final class ScannerModel: ObservableObject {
         detectedResult = result
         isScanning = false
         scanDelegate.isActivelyScanning = false
+        AudioServicesPlaySystemSound(1103)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 }
 
@@ -133,6 +136,8 @@ final class ScanDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     nonisolated(unsafe) private weak var model: ScannerModel?
     nonisolated(unsafe) var isActivelyScanning = false
     nonisolated(unsafe) private var visionFailCount = 0
+    /// Height fraction of the horizontal scan band (full width, centered).
+    private let scanBandHeight: Double = 0.15
 
     func setModel(_ model: ScannerModel) {
         self.model = model
@@ -158,6 +163,8 @@ final class ScanDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         request.symbologies = [.code128, .ean13, .ean8, .upce,
                                .i2of5, .i2of5Checksum,
                                .gs1DataBar, .gs1DataBarExpanded, .gs1DataBarLimited]
+        let insetY = (1.0 - scanBandHeight) / 2.0
+        request.regionOfInterest = CGRect(x: 0, y: insetY, width: 1.0, height: scanBandHeight)
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
         try? handler.perform([request])
@@ -169,7 +176,7 @@ final class ScanDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         }
 
         if visionResult == nil, visionFailCount >= 5,
-           let gray = MsiPlesseyDecoder.extractGrayscale(from: pixelBuffer),
+           let gray = MsiPlesseyDecoder.extractGrayscale(from: pixelBuffer, widthFraction: 1.0, heightFraction: scanBandHeight),
            let msiResult = MsiPlesseyDecoder.decodeGray(gray) {
             visionResult = BarcodeResult(value: msiResult.fullDigits, format: "MSI Plessey")
         }
@@ -231,25 +238,43 @@ struct BarcodeScannerView: View {
                     .ignoresSafeArea()
             }
 
+            ZStack {
+                Color.black.opacity(0.5)
+                    .ignoresSafeArea()
+                    .reverseMask {
+                        RoundedRectangle(cornerRadius: 12)
+                            .frame(width: 320, height: 280)
+                    }
+
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white, lineWidth: 2)
+                    .frame(width: 320, height: 280)
+            }
+            .ignoresSafeArea()
+
             VStack {
-                Spacer().frame(height: 60)
-
-                ZStack(alignment: .topTrailing) {
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white, lineWidth: 2)
-                        .frame(width: 280, height: 280)
-
+                HStack {
                     if model.hasPermission {
                         Button { model.toggleTorch() } label: {
                             Image(systemName: model.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
                                 .font(.title2)
                                 .foregroundColor(.yellow)
                         }
-                        .padding(8)
+                        .padding(16)
+                        .background(
+                            Circle()
+                                .fill(Color.black.opacity(0.5))
+                        )
+                        .padding(.leading, 24)
+                        .padding(.top, 60)
                     }
+                    Spacer()
                 }
+                Spacer()
+            }
 
-                Spacer().frame(height: 40)
+            VStack {
+                Spacer()
 
                 if !model.hasPermission {
                     Text("Camera permission required")
@@ -289,5 +314,19 @@ struct BarcodeScannerView: View {
         }
         .onAppear { model.checkPermission() }
         .onDisappear { model.stopSession() }
+    }
+}
+
+extension View {
+    @ViewBuilder
+    fileprivate func reverseMask<Mask: View>(alignment: Alignment = .center, @ViewBuilder _ mask: () -> Mask) -> some View {
+        self.mask {
+            Rectangle()
+                .overlay(alignment: alignment) {
+                    mask()
+                        .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+        }
     }
 }

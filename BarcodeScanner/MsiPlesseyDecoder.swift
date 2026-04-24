@@ -73,6 +73,10 @@ enum MsiPlesseyDecoder {
     // ── CVPixelBuffer → GrayImage (cropped to center) ──────────────────────────
 
     static func extractGrayscale(from pixelBuffer: CVPixelBuffer, centerFraction: Double = 0.6) -> GrayImage? {
+        extractGrayscale(from: pixelBuffer, widthFraction: centerFraction, heightFraction: centerFraction)
+    }
+
+    static func extractGrayscale(from pixelBuffer: CVPixelBuffer, widthFraction: Double, heightFraction: Double) -> GrayImage? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
@@ -85,8 +89,8 @@ enum MsiPlesseyDecoder {
         let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
 
-        let cropW = Int(Double(fullWidth) * centerFraction)
-        let cropH = Int(Double(fullHeight) * centerFraction)
+        let cropW = Int(Double(fullWidth) * widthFraction)
+        let cropH = Int(Double(fullHeight) * heightFraction)
         let left = (fullWidth - cropW) / 2
         let top = (fullHeight - cropH) / 2
 
@@ -334,6 +338,7 @@ enum MsiPlesseyDecoder {
             let prefix = String(s.prefix(n))
             let dataPart = String(prefix.prefix(n - 1))
             if luhnCheck(dataPart) == prefix.last {
+                guard prefix.contains(where: { $0 != "0" }) else { continue }
                 return prefix
             }
         }
