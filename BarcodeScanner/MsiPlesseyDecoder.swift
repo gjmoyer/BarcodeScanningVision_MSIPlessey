@@ -451,7 +451,7 @@ enum MsiPlesseyDecoder {
     private static func zxingFindEnd(_ row: BitRow, _ rowOffset: Int, _ counters: inout [Int], _ avgWidth: Int) -> [Int]? {
         let width = row.size
         var cp = 0
-        var ps = rowOffset
+        let ps = rowOffset
         var isWhite = false
 
         counters[0] = 0; counters[1] = 0; counters[2] = 0
