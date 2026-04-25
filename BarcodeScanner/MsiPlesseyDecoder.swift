@@ -15,6 +15,21 @@ struct MsiDecodeResult {
     let method: String
 }
 
+private struct BitRow {
+    let bits: [Bool]
+    var size: Int { bits.count }
+    subscript(i: Int) -> Bool { bits[i] }
+    func getNextSet(_ from: Int) -> Int {
+        for i in from..<bits.count { if bits[i] { return i } }
+        return bits.count
+    }
+    func isRange(_ start: Int, _ end: Int, value: Bool) -> Bool {
+        if start >= end { return true }
+        for i in start..<end { if bits[i] != value { return false } }
+        return true
+    }
+}
+
 enum MsiPlesseyDecoder {
 
     private static let bitsToDigit: [[Int]: Int] = [
@@ -25,6 +40,30 @@ enum MsiPlesseyDecoder {
         [1, 0, 0, 0]: 8, [1, 0, 0, 1]: 9,
     ]
 
+    // ── ZXing CHARACTER_ENCODINGS (Approach B) ──────────────────────────────────
+
+    private static let zxingCharacterEncodings: [Int] = [
+        0x924, 0x926, 0x934, 0x936, 0x9A4, 0x9A6, 0x9B4, 0x9B6, 0xD24, 0xD26
+    ]
+    private static let zxingAlphabet = "0123456789"
+    private static let zxingStart = 0x06
+    private static let zxingEnd = 0x09
+
+    // ── Cross-frame confidence ──────────────────────────────────────────────────
+
+    private static let scoreCombined = 3
+    private static let scoreRowScan = 2
+    private static let scoreZxingRowScan = 2
+    private static let scoreColGreedy = 1
+    private static let confidenceThreshold = 5
+
+    private static let frameLock = NSLock()
+    private static var frameScores: [String: Int] = [:]
+
+    static func reset() {
+        frameLock.withLock { frameScores.removeAll() }
+    }
+
     // ── Public API ──────────────────────────────────────────────────────────────
 
     static func decode(from pixelBuffer: CVPixelBuffer) -> MsiDecodeResult? {
@@ -34,7 +73,27 @@ enum MsiPlesseyDecoder {
 
     static func decodeGray(_ gray: GrayImage) -> MsiDecodeResult? {
         let crop = isolateBarcode(gray) ?? gray
-        return decodeBarcode(crop)
+        guard let single = decodeBarcodeV2(crop) else { return nil }
+
+        let points: Int
+        switch single.method {
+        case "combined": points = scoreCombined
+        case "row_scan": points = scoreRowScan
+        case "zxing_row_scan": points = scoreZxingRowScan
+        default: points = scoreColGreedy
+        }
+
+        let total = frameLock.withLock { () -> Int in
+            let t = (frameScores[single.digits7] ?? 0) + points
+            frameScores[single.digits7] = t
+            return t
+        }
+
+        if total >= confidenceThreshold {
+            frameLock.withLock { frameScores.removeAll() }
+            return single
+        }
+        return nil
     }
 
     // ── Rotation ────────────────────────────────────────────────────────────────
@@ -144,8 +203,11 @@ enum MsiPlesseyDecoder {
 
     private static func rowTransitions(_ img: GrayImage, _ y: Int) -> Int {
         let w = img.width
-        let mn = (0..<w).map { img.pixel($0, y) }.min() ?? 0
-        let mx = (0..<w).map { img.pixel($0, y) }.max() ?? 0
+        var mn = Int.max, mx = 0
+        for x in 0..<w {
+            let p = img.pixel(x, y)
+            if p < mn { mn = p }; if p > mx { mx = p }
+        }
         if mx - mn < 30 { return 0 }
         let thr = (mn + mx) / 2
         var prev = img.pixel(0, y) < thr ? 1 : 0
@@ -157,11 +219,26 @@ enum MsiPlesseyDecoder {
         return count
     }
 
-    // ── MSI Plessey decode ──────────────────────────────────────────────────────
+    // ── V2 decodeBarcode (dual approach + reconcile) ────────────────────────────
 
-    private static func decodeBarcode(_ img: GrayImage) -> MsiDecodeResult? {
-        if let v = rowScan(img), let norm = luhnNormalize(v) {
-            return MsiDecodeResult(digits7: String(norm.prefix(7)), fullDigits: norm, method: "row_scan")
+    private static func decodeBarcodeV2(_ img: GrayImage) -> MsiDecodeResult? {
+        var bimodal: String?
+        var zxing: String?
+        DispatchQueue.concurrentPerform(iterations: 2) { i in
+            if i == 0 {
+                bimodal = rowScan(img).flatMap { luhnNormalize($0) }
+            } else {
+                zxing = zxingRowScan(img).flatMap { luhnNormalize($0) }
+            }
+        }
+        if let b = bimodal, let z = zxing, b.prefix(7) == z.prefix(7) {
+            return MsiDecodeResult(digits7: String(b.prefix(7)), fullDigits: b, method: "combined")
+        }
+        if let b = bimodal {
+            return MsiDecodeResult(digits7: String(b.prefix(7)), fullDigits: b, method: "row_scan")
+        }
+        if let z = zxing {
+            return MsiDecodeResult(digits7: String(z.prefix(7)), fullDigits: z, method: "zxing_row_scan")
         }
         if let v = colGreedy(img) {
             return MsiDecodeResult(digits7: String(v.prefix(7)), fullDigits: v, method: "col_greedy")
@@ -169,7 +246,7 @@ enum MsiPlesseyDecoder {
         return nil
     }
 
-    // ── RLE ─────────────────────────────────────────────────────────────────────
+    // ── Approach A: Bimodal row scan ────────────────────────────────────────────
 
     private static func rle(_ row: [Int]) -> [(isDark: Bool, length: Int)] {
         guard !row.isEmpty else { return [] }
@@ -189,8 +266,6 @@ enum MsiPlesseyDecoder {
         (0..<img.width).map { img.pixel($0, y) < thr ? 1 : 0 }
     }
 
-    // ── Bimodal split ───────────────────────────────────────────────────────────
-
     private static func bimodalSplit(_ darkWidths: [Int]) -> Double? {
         guard darkWidths.count >= 6 else { return nil }
         let trimmed = darkWidths.sorted().dropLast(2)
@@ -203,8 +278,6 @@ enum MsiPlesseyDecoder {
         }
         return bestGap >= 1 ? bestSplit : nil
     }
-
-    // ── Run-list → digit string ─────────────────────────────────────────────────
 
     private static func decodeRuns(_ runs: [(Bool, Int)], _ split: Double) -> String? {
         var pos = -1
@@ -223,15 +296,17 @@ enum MsiPlesseyDecoder {
         return result.count >= 7 ? result : nil
     }
 
-    // ── Row scan ────────────────────────────────────────────────────────────────
-
     private static func rowScan(_ img: GrayImage) -> String? {
         var validVotes: [String: Int] = [:]
         var rawVotes: [String: Int] = [:]
+        var bestVotes = 0, bestRaw = 0
 
         for y in 0..<img.height {
-            let vals = (0..<img.width).map { img.pixel($0, y) }
-            let mn = vals.min() ?? 0; let mx = vals.max() ?? 0
+            var mn = Int.max, mx = 0
+            for x in 0..<img.width {
+                let p = img.pixel(x, y)
+                if p < mn { mn = p }; if p > mx { mx = p }
+            }
             guard mx - mn >= 30 else { continue }
 
             for thrPct in stride(from: 20, through: 80, by: 5) {
@@ -242,25 +317,218 @@ enum MsiPlesseyDecoder {
                 let darkWidths = runs.filter { $0.0 }.map { $0.1 }
                 guard let split = bimodalSplit(darkWidths) else { continue }
                 guard let value = decodeRuns(runs, split), value.count >= 7 else { continue }
+                guard !value.allSatisfy({ $0 == value.first }) else { continue }
 
                 if let normed = luhnNormalize(value) {
-                    validVotes[normed, default: 0] += 1
+                    let c = (validVotes[normed] ?? 0) + 1
+                    validVotes[normed] = c
+                    if c > bestVotes { bestVotes = c }
                 } else {
-                    rawVotes[value, default: 0] += 1
+                    let c = (rawVotes[value] ?? 0) + 1
+                    rawVotes[value] = c
+                    if c > bestRaw { bestRaw = c }
                 }
             }
+            if bestVotes >= 2 || bestRaw >= 2 { break }
         }
 
-        if let best = validVotes.max(by: { $0.value < $1.value }), best.value >= 2 {
-            return best.key
+        if bestVotes >= 2 {
+            return validVotes.first(where: { $0.value == bestVotes })!.key
         }
-        if let best = rawVotes.max(by: { $0.value < $1.value }), best.value >= 2 {
-            return best.key
+        if bestRaw >= 2 {
+            return rawVotes.first(where: { $0.value == bestRaw })!.key
         }
         return nil
     }
 
-    // ── Column greedy ───────────────────────────────────────────────────────────
+    // ── Approach B: ZXing run-counter row scan ──────────────────────────────────
+
+    private static func zxingRowScan(_ img: GrayImage) -> String? {
+        var validVotes: [String: Int] = [:]
+        var rawVotes: [String: Int] = [:]
+        var bestVotes = 0, bestRaw = 0
+
+        for y in 0..<img.height {
+            var mn = Int.max, mx = 0
+            for x in 0..<img.width {
+                let p = img.pixel(x, y)
+                if p < mn { mn = p }; if p > mx { mx = p }
+            }
+            guard mx - mn >= 30 else { continue }
+
+            for thrPct in stride(from: 20, through: 80, by: 5) {
+                let thr = mn + (mx - mn) * thrPct / 100
+                let bitRow = BitRow(bits: (0..<img.width).map { img.pixel($0, y) < thr })
+                guard let decoded = zxingDecodeRow(bitRow) else { continue }
+                guard !decoded.allSatisfy({ $0 == decoded.first }) else { continue }
+
+                if let normed = luhnNormalize(decoded) {
+                    let c = (validVotes[normed] ?? 0) + 1
+                    validVotes[normed] = c
+                    if c > bestVotes { bestVotes = c }
+                } else {
+                    let c = (rawVotes[decoded] ?? 0) + 1
+                    rawVotes[decoded] = c
+                    if c > bestRaw { bestRaw = c }
+                }
+            }
+            if bestVotes >= 2 || bestRaw >= 2 { break }
+        }
+
+        if bestVotes >= 2 {
+            return validVotes.first(where: { $0.value == bestVotes })!.key
+        }
+        if bestRaw >= 2 {
+            return rawVotes.first(where: { $0.value == bestRaw })!.key
+        }
+        return nil
+    }
+
+    private static func zxingDecodeRow(_ row: BitRow) -> String? {
+        var counters = [Int](repeating: 0, count: 8)
+        guard let start = zxingFindStart(row, &counters) else { return nil }
+        let avgWidth = start[2]
+        var nextStart = row.getNextSet(start[1])
+        var result = ""
+
+        while true {
+            guard zxingRecordPattern(row, nextStart, &counters, 8) else {
+                guard zxingFindEnd(row, nextStart, &counters, avgWidth) != nil else { return nil }
+                break
+            }
+            let pattern = zxingToPattern(counters, 8, avgWidth)
+            guard let ch = zxingPatternToChar(pattern) else {
+                guard zxingFindEnd(row, nextStart, &counters, avgWidth) != nil else { return nil }
+                break
+            }
+            result.append(ch)
+            for c in counters { nextStart += c }
+            nextStart = row.getNextSet(nextStart)
+        }
+
+        return result.count >= 3 ? result : nil
+    }
+
+    private static func zxingFindStart(_ row: BitRow, _ counters: inout [Int]) -> [Int]? {
+        let width = row.size
+        let rowOffset = row.getNextSet(0)
+        var cp = 0
+        var ps = rowOffset
+        var isWhite = false
+
+        counters[0] = 0; counters[1] = 0
+
+        for i in rowOffset..<width {
+            if row[i] != isWhite {
+                counters[cp] += 1
+            } else {
+                if cp == 1 {
+                    if counters[1] != 0 {
+                        let factor = Float(counters[0]) / Float(counters[1])
+                        if factor >= 1.5 && factor <= 5.0 {
+                            let avgWidth = zxingCalcAvgWidth(counters, 2)
+                            if zxingToPattern(counters, 2, avgWidth) == zxingStart {
+                                let quietStart = max(0, ps - ((i - ps) >> 1))
+                                if row.isRange(quietStart, ps, value: false) {
+                                    return [ps, i, avgWidth]
+                                }
+                            }
+                        }
+                    }
+                    ps += counters[0] + counters[1]
+                    counters[0] = 0; counters[1] = 0
+                    cp -= 1
+                } else {
+                    cp += 1
+                }
+                counters[cp] = 1
+                isWhite = !isWhite
+            }
+        }
+        return nil
+    }
+
+    private static func zxingFindEnd(_ row: BitRow, _ rowOffset: Int, _ counters: inout [Int], _ avgWidth: Int) -> [Int]? {
+        let width = row.size
+        var cp = 0
+        var ps = rowOffset
+        var isWhite = false
+
+        counters[0] = 0; counters[1] = 0; counters[2] = 0
+
+        for i in rowOffset..<width {
+            if row[i] != isWhite {
+                counters[cp] += 1
+            } else {
+                if cp == 2 {
+                    if counters[0] != 0 {
+                        let factor = Float(counters[1]) / Float(counters[0])
+                        if factor >= 1.5 && factor <= 5.0 && zxingToPattern(counters, 3, avgWidth) == zxingEnd {
+                            let minEnd = min(row.size - 1, i + ((i - ps) >> 1))
+                            if row.isRange(i, minEnd, value: false) {
+                                return [ps, i]
+                            }
+                        }
+                    }
+                    return nil
+                }
+                cp += 1
+                counters[cp] = 1
+                isWhite = !isWhite
+            }
+        }
+        return nil
+    }
+
+    private static func zxingRecordPattern(_ row: BitRow, _ start: Int, _ counters: inout [Int], _ n: Int) -> Bool {
+        for i in 0..<n { counters[i] = 0 }
+        if start >= row.size { return false }
+        var isWhite = !row[start]
+        var cp = 0; var i = start
+        while i < row.size {
+            if row[i] != isWhite { counters[cp] += 1 }
+            else {
+                cp += 1
+                if cp == n { break }
+                counters[cp] = 1
+                isWhite = !isWhite
+            }
+            i += 1
+        }
+        return cp == n || (cp == n - 1 && i == row.size)
+    }
+
+    private static func zxingCalcAvgWidth(_ counters: [Int], _ len: Int) -> Int {
+        var mn = Int.max; var mx = 0
+        for i in 0..<len {
+            if counters[i] < mn { mn = counters[i] }
+            if counters[i] > mx { mx = counters[i] }
+        }
+        return ((mx << 8) + (mn << 8)) / 2
+    }
+
+    private static func zxingToPattern(_ counters: [Int], _ len: Int, _ avgWidth: Int) -> Int {
+        var pattern = 0; var bit = 1; var doubleBit = 3
+        for i in 0..<len {
+            if (counters[i] << 8) < avgWidth {
+                pattern = (pattern << 1) | bit
+            } else {
+                pattern = (pattern << 2) | doubleBit
+            }
+            bit ^= 1
+            doubleBit ^= 3
+        }
+        return pattern
+    }
+
+    private static func zxingPatternToChar(_ pattern: Int) -> Character? {
+        for (i, enc) in zxingCharacterEncodings.enumerated() {
+            if enc == pattern { return zxingAlphabet[zxingAlphabet.index(zxingAlphabet.startIndex, offsetBy: i)] }
+        }
+        return nil
+    }
+
+    // ── Fallback: Column greedy ─────────────────────────────────────────────────
 
     private static func colSignal(_ img: GrayImage) -> [Double]? {
         let w = img.width; let h = img.height
@@ -307,6 +575,7 @@ enum MsiPlesseyDecoder {
                 let maxOff = min(w - minW, 80)
                 for off in stride(from: 0, through: maxOff, by: 5) {
                     guard let r = greedy(sig, N, W, off) else { continue }
+                    guard !r.allSatisfy({ $0 == r.first }) else { continue }
                     if let normed = luhnNormalize(r) {
                         votes[normed, default: 0] += 1
                     }

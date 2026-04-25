@@ -61,7 +61,7 @@ final class ScannerModel: ObservableObject {
         session.commitConfiguration()
         sessionReady = true
 
-        if let connection = output.connection(with: .video), connection.isVideoOrientationSupported {
+        if let connection = output.connection(with: .video) {
             updateVideoOrientation(on: connection)
         }
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -77,8 +77,7 @@ final class ScannerModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let output = self?.videoOutput,
-                  let connection = output.connection(with: .video),
-                  connection.isVideoOrientationSupported else { return }
+                  let connection = output.connection(with: .video) else { return }
             self?.updateVideoOrientation(on: connection)
         }
     }
@@ -94,6 +93,7 @@ final class ScannerModel: ObservableObject {
     }
 
     func startScanning() {
+        MsiPlesseyDecoder.reset()
         detectedResult = nil
         isScanning = true
         scanDelegate.isActivelyScanning = true
@@ -178,7 +178,14 @@ final class ScanDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         if visionResult == nil, visionFailCount >= 5,
            let gray = MsiPlesseyDecoder.extractGrayscale(from: pixelBuffer, widthFraction: 1.0, heightFraction: scanBandHeight),
            let msiResult = MsiPlesseyDecoder.decodeGray(gray) {
-            visionResult = BarcodeResult(value: msiResult.fullDigits, format: "MSI Plessey")
+            let fmt: String
+            switch msiResult.method {
+            case "combined": fmt = "MSI Plessey (combined)"
+            case "zxing_row_scan": fmt = "MSI Plessey (ZXing)"
+            case "col_greedy": fmt = "MSI Plessey (greedy)"
+            default: fmt = "MSI Plessey"
+            }
+            visionResult = BarcodeResult(value: msiResult.fullDigits, format: fmt)
         }
 
         if let result = visionResult {
